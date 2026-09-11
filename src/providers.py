@@ -34,7 +34,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         api_key_env="GROQ_API_KEY",
         model_env="GROQ_MODEL",
         base_url="https://api.groq.com/openai/v1",
-        default_model="",
+        default_model="openai/gpt-oss-20b",
     ),
 }
 
@@ -72,8 +72,6 @@ def get_provider_client(provider: str, *, model_override: str | None = None) -> 
     elif os.getenv("OPENAI_BASE_URL"):
         kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
 
-    # OpenRouter accepts optional attribution headers. They are intentionally
-    # opt-in so the local app works without extra configuration.
     if provider == "openrouter":
         headers: dict[str, str] = {}
         if os.getenv("OPENROUTER_SITE_URL"):
@@ -84,3 +82,10 @@ def get_provider_client(provider: str, *, model_override: str | None = None) -> 
             kwargs["default_headers"] = headers
 
     return OpenAI(**kwargs), get_provider_model(provider, model_override)
+
+
+def get_completion_extras(provider: str) -> dict[str, object]:
+    """Provider-specific request hints focused on latency."""
+    if provider == "openrouter":
+        return {"extra_body": {"provider": {"sort": "latency"}}}
+    return {}

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 PAGE_CITATION_RE = re.compile(r"\[Page\s+(\d+)\]", re.IGNORECASE)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CitationCheck:
     cited_pages: tuple[int, ...]
     valid_pages: tuple[int, ...]
@@ -27,13 +27,18 @@ def validate_citations(answer: str, source_pages: set[int]) -> CitationCheck:
     )
 
 
-def build_context(retrieved: list[dict], max_chars_per_source: int = 1000) -> str:
-    """Build compact, structured evidence with section metadata for low-latency grounded generation."""
+def build_context(retrieved: list[dict], max_chars_per_source: int | None = None) -> str:
+    """Build complete, structured evidence for grounded generation.
+
+    The default intentionally does not truncate retrieved chunks. Retrieval is
+    already bounded, and preserving complete passages avoids silent loss of
+    names, numbers, list items, table rows, or paragraph continuations.
+    """
     sections: list[str] = []
     for index, item in enumerate(retrieved, start=1):
         chunk = item["chunk"]
         text = chunk.text.strip()
-        if len(text) > max_chars_per_source:
+        if max_chars_per_source is not None and len(text) > max_chars_per_source:
             text = text[:max_chars_per_source].rstrip() + "…"
         section = getattr(chunk, "section", "") or "Unsectioned"
         sections.append(
@@ -46,8 +51,8 @@ def build_context(retrieved: list[dict], max_chars_per_source: int = 1000) -> st
     return "\n\n---\n\n".join(sections)
 
 
-def build_followup_query(question: str, history: list[dict], max_history_chars: int = 1200) -> str:
-    """Resolve short follow-up questions using a small amount of recent context."""
+def build_followup_query(question: str, history: list[dict], max_history_chars: int = 2400) -> str:
+    """Resolve short follow-up questions using recent conversational context."""
     cleaned = question.strip()
     if not history:
         return cleaned
@@ -55,14 +60,27 @@ def build_followup_query(question: str, history: list[dict], max_history_chars: 
     previous_user = next(
         (m["content"] for m in reversed(history) if m.get("role") == "user"),
         "",
-    )
-    previous_user = previous_user.strip()
+    ).strip()
     if not previous_user:
         return cleaned
 
     followup = cleaned.lower()
     cues = (
-        followup.startswith(("what about", "how about", "and ", "why ", "how ", "does ", "did ", "can ", "could ", "what does that", "what is that"))
+        followup.startswith(
+            (
+                "what about",
+                "how about",
+                "and ",
+                "why ",
+                "how ",
+                "does ",
+                "did ",
+                "can ",
+                "could ",
+                "what does that",
+                "what is that",
+            )
+        )
         or len(cleaned.split()) <= 7
     )
     if not cues:

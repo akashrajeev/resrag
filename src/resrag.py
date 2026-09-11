@@ -201,9 +201,14 @@ class HybridIndex:
         second = candidate_ids[1] if len(candidate_ids) > 1 else best
         if best == second:
             return False
-        agreement = best in dense_rank[:3] and best in sparse_rank[:3]
+        # Hybrid retrieval already gives us strong evidence. When both
+        # independent retrievers agree on the same top result, avoid the
+        # expensive cross-encoder. Rerank only disagreement/ambiguous cases.
+        independent_agreement = bool(dense_rank and sparse_rank and dense_rank[0] == best and sparse_rank[0] == best)
+        if independent_agreement:
+            return False
         relative_margin = (fused[best] - fused[second]) / max(abs(fused[best]), 1e-9)
-        return not (agreement and relative_margin >= self.rerank_skip_margin)
+        return relative_margin < self.rerank_skip_margin
 
     def retrieve(
         self,
@@ -235,7 +240,6 @@ class HybridIndex:
             return np.asarray(self.bm25.get_scores(tokenize(query)), dtype=np.float32)
 
         parallel_start = perf_counter()
-        # Dense query encoding and BM25 scoring are independent and can overlap.
         with ThreadPoolExecutor(max_workers=2) as pool:
             dense_future = pool.submit(encode_query)
             sparse_future = pool.submit(score_sparse)

@@ -48,7 +48,7 @@ OPENAI_MODEL=...
 
 ### OpenRouter
 
-OpenRouter exposes an OpenAI-compatible API at `https://openrouter.ai/api/v1`, so the same OpenAI client can be used with an OpenRouter key and model slug. citeturn356248search4turn356248search7
+OpenRouter exposes an OpenAI-compatible API at `https://openrouter.ai/api/v1`, so the same OpenAI client can be used with an OpenRouter key and model slug.
 
 ```text
 LLM_PROVIDER=openrouter
@@ -60,7 +60,7 @@ Optional attribution headers are supported with `OPENROUTER_SITE_URL` and `OPENR
 
 ### Groq
 
-Groq documents OpenAI-compatible usage with the base URL `https://api.groq.com/openai/v1`, so ResRAG can use Groq without a separate generation code path. citeturn356248search0turn356248search9
+Groq exposes an OpenAI-compatible API at `https://api.groq.com/openai/v1`, so ResRAG can use Groq without a separate generation code path.
 
 ```text
 LLM_PROVIDER=groq

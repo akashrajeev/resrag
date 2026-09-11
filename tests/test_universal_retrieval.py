@@ -9,10 +9,12 @@ class SemanticEmbedder:
         vectors = []
         for text in texts:
             lower = text.lower()
-            if "selected work" in lower or "yatra" in lower or "commerce" in lower or "resrag" in lower:
+            if any(term in lower for term in ("selected work", "project", "yatra", "commerce", "resrag")):
                 vectors.append([1.0, 0.0])
-            elif "technical capabilities" in lower or "python" in lower:
+            elif any(term in lower for term in ("technical capabilities", "python", "docker", "fastapi")):
                 vectors.append([0.0, 1.0])
+            elif any(term in lower for term in ("revenue", "financial")):
+                vectors.append([0.9, 0.1])
             else:
                 vectors.append([0.4, 0.4])
         return np.asarray(vectors, dtype=np.float32)
@@ -28,6 +30,7 @@ def test_arbitrary_group_heading_is_searchable_and_siblings_are_recovered():
     index = UniversalHybridIndex("fake", embedder=SemanticEmbedder())
     index.build(chunks)
 
+    assert "Section: Selected Work" in index.retrieval_texts[0]
     results = index.retrieve("What are the projects?", dense_k=4, sparse_k=4, final_k=4)
     text = " ".join(item["chunk"].text for item in results)
 

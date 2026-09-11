@@ -20,3 +20,17 @@ def test_extract_pdf_preserves_page_numbers(tmp_path: Path):
     assert chunks[0].page == 1
     assert any(chunk.page == 2 for chunk in chunks)
     assert all(chunk.kind in {"text", "table", "ocr"} for chunk in chunks)
+
+
+def test_ocr_fallback_marks_ocr_chunks(tmp_path: Path, monkeypatch):
+    pdf_path = tmp_path / "scanned.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(pdf_path)
+    doc.close()
+
+    monkeypatch.setattr("src.resrag._ocr_page_text", lambda page: "Recovered scanned text")
+    chunks = extract_pdf(pdf_path, enable_ocr=True)
+
+    assert chunks
+    assert all(chunk.kind == "ocr" for chunk in chunks)

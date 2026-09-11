@@ -68,10 +68,7 @@ def _find_tables(page: fitz.Page):
 
 
 def _ocr_page_text(page: fitz.Page) -> str:
-    """Best-effort OCR fallback using the Tesseract-backed PyMuPDF API.
-
-    OCR is opt-in with OCR_ENABLED=1 because Tesseract is a system dependency.
-    """
+    """Best-effort OCR fallback using the Tesseract-backed PyMuPDF API."""
     try:
         text_page = page.get_textpage_ocr(language="eng", dpi=180, full=True)
         return _clean_text(page.get_text("text", textpage=text_page))
@@ -94,11 +91,13 @@ def extract_pdf(
             tables = _find_tables(page)
             table_rects = [fitz.Rect(table.bbox) for table in tables]
             page_text = _extract_page_text_without_tables(page, table_rects)
-            if len(page_text.split()) < 8 and ocr_enabled:
+            use_ocr = len(page_text.split()) < 8 and ocr_enabled
+            if use_ocr:
                 page_text = _ocr_page_text(page)
 
+            chunk_kind = "ocr" if use_ocr and page_text else "text"
             for part in split_into_chunks(page_text, max_words, overlap_words):
-                chunks.append(Chunk(len(chunks), page_number, part, kind="text"))
+                chunks.append(Chunk(len(chunks), page_number, part, kind=chunk_kind))
 
             for table_index, table in enumerate(tables, start=1):
                 try:
@@ -167,9 +166,13 @@ class HybridIndex:
         sparse_k: int = 16,
         final_k: int = 6,
     ) -> list[dict[str, Any]]:
+        if not query.strip() or final_k <= 0:
+            return []
         if not self.chunks or self.embeddings is None or self.bm25 is None:
             raise RuntimeError("Index has not been built.")
 
+        dense_k = min(max(dense_k, 1), len(self.chunks))
+        sparse_k = min(max(sparse_k, 1), len(self.chunks))
         q = self.embedder.encode([query], normalize_embeddings=True, convert_to_numpy=True)[0]
         dense_scores = self.embeddings @ q
         dense_rank = np.argsort(-dense_scores)[:dense_k].tolist()

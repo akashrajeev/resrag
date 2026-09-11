@@ -331,10 +331,11 @@ class HybridIndex:
             return score + 0.001 * float(dense_scores[idx])
 
         expanded: list[int] = list(candidate_ids)
+        target_k = max(final_k, int(os.getenv("COVERAGE_FINAL_K", "8")))
+
         if target_sections:
             for section in target_sections:
                 expanded.extend(self.section_to_ids.get(section, []))
-            target_k = max(final_k, int(os.getenv("COVERAGE_FINAL_K", "8")))
         else:
             section_scores: list[tuple[float, str]] = []
             for section, ids in self.section_to_ids.items():
@@ -345,18 +346,32 @@ class HybridIndex:
             for section in selected_sections:
                 ranked = sorted(self.section_to_ids.get(section, []), key=local_score, reverse=True)
                 expanded.extend(ranked[:2])
-            target_k = max(final_k, int(os.getenv("COVERAGE_FINAL_K", "8")))
+
+        # Lightweight fallback for PDFs where headings are not recoverable:
+        # expand the most relevant pages. This preserves coverage without a
+        # second LLM call or another embedding pass.
+        if profile != "focused" and not target_sections:
+            page_order: list[int] = []
+            for idx in candidate_ids:
+                page = self.chunks[idx].page
+                if page not in page_order:
+                    page_order.append(page)
+                if len(page_order) >= 2:
+                    break
+            for page in page_order:
+                expanded.extend(idx for idx, chunk in enumerate(self.chunks) if chunk.page == page)
 
         deduped = list(dict.fromkeys(expanded))
         if target_sections:
             ordered: list[int] = []
+            per_section = max(1, int(np.ceil(target_k / len(target_sections))))
             for section in target_sections:
                 section_candidates = sorted(
                     [idx for idx in deduped if self.chunks[idx].section == section],
                     key=local_score,
                     reverse=True,
                 )
-                ordered.extend(section_candidates[:target_k])
+                ordered.extend(section_candidates[:per_section])
             ordered.extend([idx for idx in deduped if idx not in ordered])
             return ordered, target_k
 

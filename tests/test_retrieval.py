@@ -17,7 +17,7 @@ class FakeReranker:
         return np.asarray([2.0 if "python" in text.lower() else 0.1 for _, text in pairs], dtype=np.float32)
 
 
-def test_hybrid_retrieval_can_use_dense_and_reranker():
+def test_forced_reranking_uses_cross_encoder():
     chunks = [
         Chunk(0, 1, "Python is used for data analysis."),
         Chunk(1, 2, "The office is located in Berlin."),
@@ -25,10 +25,25 @@ def test_hybrid_retrieval_can_use_dense_and_reranker():
     ]
     index = HybridIndex("fake", "fake", embedder=FakeEmbedder(), reranker=FakeReranker())
     index.build(chunks)
-    results = index.retrieve("python", dense_k=3, sparse_k=3, final_k=2)
+    results = index.retrieve("python", dense_k=3, sparse_k=3, final_k=2, rerank_mode="on")
     assert len(results) == 2
     assert results[0]["chunk"].page in {1, 3}
     assert "rerank_score" in results[0]
+    assert index.last_rerank_mode == "on"
+
+
+def test_auto_mode_skips_reranking_when_retrievers_agree():
+    chunks = [
+        Chunk(0, 1, "Python is used for data analysis."),
+        Chunk(1, 2, "Berlin is the office location."),
+        Chunk(2, 3, "Cooking recipes are unrelated."),
+    ]
+    index = HybridIndex("fake", "fake", embedder=FakeEmbedder(), reranker=FakeReranker())
+    index.build(chunks)
+    results = index.retrieve("python", dense_k=3, sparse_k=3, final_k=2, rerank_mode="auto")
+    assert len(results) == 2
+    assert index.last_rerank_mode == "off"
+    assert "rerank_score" not in results[0]
 
 
 def test_empty_query_returns_no_results():

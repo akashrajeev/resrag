@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,22 +19,110 @@ class Chunk:
     chunk_id: int
     page: int
     text: str
+    kind: str = "text"
+    table_id: int | None = None
 
 
 def _clean_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def extract_pdf(path: str | Path, max_words: int = 220, overlap_words: int = 40) -> list[Chunk]:
-    """Extract text page-by-page and make citation-friendly chunks."""
+def _rect_contains(outer: fitz.Rect, inner: fitz.Rect, tolerance: float = 2.0) -> bool:
+    return (
+        outer.x0 - tolerance <= inner.x0
+        and outer.y0 - tolerance <= inner.y0
+        and outer.x1 + tolerance >= inner.x1
+        and outer.y1 + tolerance >= inner.y1
+    )
+
+
+def _extract_page_text_without_tables(page: fitz.Page, table_rects: list[fitz.Rect]) -> str:
+    blocks = page.get_text("blocks", sort=True)
+    parts: list[str] = []
+    for block in blocks:
+        if len(block) < 5:
+            continue
+        rect = fitz.Rect(block[:4])
+        text = block[4]
+        if any(_rect_contains(table_rect, rect) for table_rect in table_rects):
+            continue
+        cleaned = _clean_text(text)
+        if cleaned:
+            parts.append(cleaned)
+    return "\n\n".join(parts)
+
+
+def _ocr_page_text(page: fitz.Page) -> str:
+    """Best-effort OCR fallback using the Tesseract-backed PyMuPDF API.
+
+    OCR is opt-in with OCR_ENABLED=1 because Tesseract is a system dependency.
+    """
+    try:
+        text_page = page.get_textpage_ocr(language="eng", dpi=180, full=True)
+        return _clean_text(page.get_text("text", textpage=text_page))
+    except Exception:
+        return ""
+
+
+def extract_pdf(
+    path: str | Path,
+    max_words: int = 220,
+    overlap_words: int = 40,
+    enable_ocr: bool | None = None,
+) -> list[Chunk]:
+    """Extract page-aware text and native PDF tables into citation-friendly chunks."""
     chunks: list[Chunk] = []
+    ocr_enabled = enable_ocr if enable_ocr is not None else os.getenv("OCR_ENABLED", "0") == "1"
+
     with fitz.open(Path(path)) as doc:
         for page_number, page in enumerate(doc, start=1):
-            text = _clean_text(page.get_text("text"))
-            for part in split_into_chunks(text, max_words, overlap_words):
-                chunks.append(Chunk(len(chunks), page_number, part))
+            tables = []
+            try:
+                tables = list(page.find_tables(strategy="lines_strict").tables)
+            except Exception:
+                try:
+                    tables = list(page.find_tables(strategy="text").tables)
+                except Exception:
+                    tables = []
+
+            table_rects = [fitz.Rect(table.bbox) for table in tables]
+            page_text = _extract_page_text_without_tables(page, table_rects)
+            if len(page_text.split()) < 8 and ocr_enabled:
+                page_text = _ocr_page_text(page)
+
+            for part in split_into_chunks(page_text, max_words, overlap_words):
+                chunks.append(Chunk(len(chunks), page_number, part, kind="text"))
+
+            for table_index, table in enumerate(tables, start=1):
+                try:
+                    markdown = _clean_text(table.to_markdown())
+                except Exception:
+                    rows = table.extract()
+                    markdown = _clean_text(
+                        "\n".join(" | ".join((cell or "").strip() for cell in row) for row in rows)
+                    )
+                if markdown:
+                    chunks.append(
+                        Chunk(
+                            len(chunks),
+                            page_number,
+                            f"Table {table_index} on page {page_number}:\n{markdown}",
+                            kind="table",
+                            table_id=table_index,
+                        )
+                    )
+
+    if not chunks and ocr_enabled:
+        # A second pass makes OCR useful even when every page had unusual layout.
+        with fitz.open(Path(path)) as doc:
+            for page_number, page in enumerate(doc, start=1):
+                ocr_text = _ocr_page_text(page)
+                for part in split_into_chunks(ocr_text, max_words, overlap_words):
+                    chunks.append(Chunk(len(chunks), page_number, part, kind="ocr"))
+
     return chunks
 
 
@@ -58,7 +147,7 @@ class HybridIndex:
 
     def build(self, chunks: list[Chunk]) -> None:
         if not chunks:
-            raise ValueError("No text could be extracted from the PDF.")
+            raise ValueError("No usable text or tables could be extracted from the PDF.")
         self.chunks = chunks
         self.embeddings = self.embedder.encode(
             [c.text for c in chunks],
@@ -68,7 +157,13 @@ class HybridIndex:
         ).astype(np.float32)
         self.bm25 = BM25Okapi([tokenize(c.text) for c in chunks])
 
-    def retrieve(self, query: str, dense_k: int = 12, sparse_k: int = 12, final_k: int = 6) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        dense_k: int = 16,
+        sparse_k: int = 16,
+        final_k: int = 6,
+    ) -> list[dict[str, Any]]:
         if not self.chunks or self.embeddings is None or self.bm25 is None:
             raise RuntimeError("Index has not been built.")
 
@@ -78,7 +173,7 @@ class HybridIndex:
         sparse_scores = np.asarray(self.bm25.get_scores(tokenize(query)), dtype=np.float32)
         sparse_rank = np.argsort(-sparse_scores)[:sparse_k].tolist()
 
-        # RRF keeps sparse and dense score calibration independent.
+        # Reciprocal Rank Fusion avoids needing to calibrate BM25 and cosine scores.
         fused: dict[int, float] = {}
         for rank, idx in enumerate(dense_rank, start=1):
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (60.0 + rank)
@@ -93,7 +188,7 @@ class HybridIndex:
                 "dense_score": float(dense_scores[idx]),
                 "bm25_score": float(sparse_scores[idx]),
             }
-            for idx in candidate_ids[: max(final_k * 3, 12)]
+            for idx in candidate_ids[: max(final_k * 4, 16)]
         ]
 
         if self.reranker and candidates:
@@ -102,4 +197,5 @@ class HybridIndex:
             for item, score in zip(candidates, scores, strict=True):
                 item["rerank_score"] = float(score)
             candidates.sort(key=lambda item: item["rerank_score"], reverse=True)
+
         return candidates[:final_k]

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from src.providers import get_provider_client, get_provider_config, get_provider_model
+from src.providers import get_completion_extras, get_provider_client, get_provider_config, get_provider_model
 
 
 def test_provider_configs_have_expected_endpoints():
     assert get_provider_config("openai").base_url is None
     assert get_provider_config("openrouter").base_url == "https://openrouter.ai/api/v1"
     assert get_provider_config("groq").base_url == "https://api.groq.com/openai/v1"
+
+
+def test_groq_has_fast_default_model(monkeypatch):
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    assert get_provider_model("groq") == "openai/gpt-oss-20b"
 
 
 def test_provider_model_prefers_specific_environment(monkeypatch):
@@ -28,3 +34,8 @@ def test_provider_client_uses_provider_key(monkeypatch):
     assert model == "test-model"
     assert client.base_url.host == "api.groq.com"
     assert client.base_url.path == "/openai/v1/"
+
+
+def test_openrouter_latency_routing_extra():
+    assert get_completion_extras("openrouter") == {"extra_body": {"provider": {"sort": "latency"}}}
+    assert get_completion_extras("groq") == {}

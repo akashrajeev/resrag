@@ -39,3 +39,9 @@ def test_provider_client_uses_provider_key(monkeypatch):
 def test_openrouter_latency_routing_extra():
     assert get_completion_extras("openrouter") == {"extra_body": {"provider": {"sort": "latency"}}}
     assert get_completion_extras("groq") == {}
+
+
+def test_groq_gpt_oss_uses_low_reasoning():
+    assert get_completion_extras("groq", "openai/gpt-oss-20b") == {
+        "extra_body": {"reasoning_effort": "low", "include_reasoning": False}
+    }

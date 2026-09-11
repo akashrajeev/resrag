@@ -86,6 +86,8 @@ copy .env.example .env   # Windows
 streamlit run app.py
 ```
 
+The requirements include matching PyTorch/torchvision versions because Streamlit's module watcher can inspect optional Transformers vision modules on Windows. This is not used by the RAG pipeline itself, but keeping the dependency installed prevents the repeated `ModuleNotFoundError: torchvision` watcher errors.
+
 The embedding and reranker models are downloaded from Hugging Face on first use.
 
 ### OCR note

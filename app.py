@@ -7,10 +7,10 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from src.grounding import build_context, build_followup_query, validate_citations
+from src.providers import get_provider_client, get_provider_config, provider_keys
 from src.resrag import HybridIndex, extract_pdf
 
 load_dotenv()
@@ -19,7 +19,6 @@ st.set_page_config(page_title="ResRAG", page_icon="R", layout="wide", initial_si
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "")
 
 st.markdown(
     """
@@ -70,19 +69,13 @@ def build_index(chunks):
     )
 
 
-def get_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Add OPENAI_API_KEY to your .env file.")
-    kwargs = {"api_key": api_key}
-    if os.getenv("OPENAI_BASE_URL"):
-        kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
-    return OpenAI(**kwargs)
-
-
-def generate_answer(question: str, retrieved: list[dict], history: list[dict]) -> str:
-    if not OPENAI_MODEL:
-        raise RuntimeError("Add OPENAI_MODEL to your .env file.")
+def generate_answer(
+    question: str,
+    retrieved: list[dict],
+    history: list[dict],
+    provider: str,
+    model: str,
+) -> str:
     context = build_context(retrieved)
     recent_history = "\n".join(
         f"{item['role'].upper()}: {item['content']}" for item in history[-4:]
@@ -100,8 +93,9 @@ Write naturally and directly. Do not describe the retrieval machinery."""
         f"PDF evidence:\n{context}\n\n"
         f"Current question: {question}"
     )
-    response = get_client().chat.completions.create(
-        model=OPENAI_MODEL,
+    client, _ = get_provider_client(provider, model_override=model)
+    response = client.chat.completions.create(
+        model=model,
         temperature=0,
         messages=[
             {"role": "system", "content": system},
@@ -133,9 +127,31 @@ def render_citation_status(answer: str, sources: list[dict]):
         st.caption("The answer did not include a page citation; review the source passages below.")
 
 
+provider_slugs = provider_keys()
+provider_labels = {slug: get_provider_config(slug).name for slug in provider_slugs}
+configured_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+if configured_provider not in provider_slugs:
+    configured_provider = "openai"
+
 with st.sidebar:
     st.markdown("<div class='brand'>ResRAG</div><div class='brand-sub'>PDF knowledge, kept grounded.</div>", unsafe_allow_html=True)
     st.write("")
+
+    selected_provider = st.selectbox(
+        "Model provider",
+        provider_slugs,
+        index=provider_slugs.index(configured_provider),
+        format_func=lambda slug: provider_labels[slug],
+    )
+    provider_config = get_provider_config(selected_provider)
+    env_model = os.getenv(provider_config.model_env) or os.getenv("LLM_MODEL") or ""
+    model = st.text_input(
+        "Model",
+        value=env_model,
+        placeholder=f"Set {provider_config.model_env}",
+        help="The model ID supported by the selected provider.",
+    ).strip()
+
     uploaded = st.file_uploader("Document", type=["pdf"], label_visibility="collapsed")
     if uploaded:
         st.caption(uploaded.name)
@@ -165,6 +181,11 @@ with st.sidebar:
             finally:
                 Path(path).unlink(missing_ok=True)
     st.divider()
+    st.markdown("**Model provider**")
+    st.caption(
+        f"{provider_labels[selected_provider]} · {model or 'model not configured'}\n"
+        f"Key · {provider_config.api_key_env}"
+    )
     st.markdown("**About**")
     st.markdown("Hybrid BM25 + dense retrieval, RRF fusion, and cross-encoder reranking, with page-aware text, tables, and optional OCR.")
     st.caption(f"Embedding · {EMBEDDING_MODEL}\nReranker · {RERANKER_MODEL}")
@@ -202,18 +223,25 @@ else:
             st.markdown(question)
         with st.chat_message("assistant"):
             try:
+                if not model:
+                    raise RuntimeError(f"Add {provider_config.model_env} or enter a model in the sidebar.")
                 retrieval_query = build_followup_query(question, history_before)
                 with st.spinner("Searching the document…"):
                     sources = st.session_state.index.retrieve(retrieval_query, dense_k=16, sparse_k=16, final_k=6)
                 if not sources:
                     raise RuntimeError("No relevant passages were found in the document.")
                 with st.spinner("Writing the answer…"):
-                    answer = generate_answer(question, sources, history_before)
+                    answer = generate_answer(question, sources, history_before, selected_provider, model)
                 st.markdown(answer)
                 render_citation_status(answer, sources)
                 render_sources(sources)
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": answer, "sources": sources, "citation_check": True}
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources,
+                        "citation_check": True,
+                    }
                 )
             except Exception as exc:
                 message = f"I couldn't answer that yet: {exc}"

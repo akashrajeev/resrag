@@ -115,11 +115,10 @@ def render_sources(sources: list[dict]):
     with st.expander(f"Sources · {len(sources)} passages"):
         for item in sources:
             chunk = item["chunk"]
-            score = item.get("rerank_score", item.get("hybrid_score", 0))
             label = "Table" if chunk.kind == "table" else chunk.kind.capitalize()
             safe_text = html.escape(chunk.text)
             st.markdown(
-                f"<div class='source-card'><div class='source-meta'>Page {chunk.page} · {label} · {score:.3f}</div><div class='source-text'>{safe_text}</div></div>",
+                f"<div class='source-card'><div class='source-meta'>Page {chunk.page} · {label}</div><div class='source-text'>{safe_text}</div></div>",
                 unsafe_allow_html=True,
             )
 

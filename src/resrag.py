@@ -55,6 +55,18 @@ def _extract_page_text_without_tables(page: fitz.Page, table_rects: list[fitz.Re
     return "\n\n".join(parts)
 
 
+def _find_tables(page: fitz.Page):
+    """Try strict line-based detection first, then text-based detection."""
+    for strategy in ("lines_strict", "text"):
+        try:
+            found = list(page.find_tables(strategy=strategy).tables)
+        except Exception:
+            found = []
+        if found:
+            return found
+    return []
+
+
 def _ocr_page_text(page: fitz.Page) -> str:
     """Best-effort OCR fallback using the Tesseract-backed PyMuPDF API.
 
@@ -79,15 +91,7 @@ def extract_pdf(
 
     with fitz.open(Path(path)) as doc:
         for page_number, page in enumerate(doc, start=1):
-            tables = []
-            try:
-                tables = list(page.find_tables(strategy="lines_strict").tables)
-            except Exception:
-                try:
-                    tables = list(page.find_tables(strategy="text").tables)
-                except Exception:
-                    tables = []
-
+            tables = _find_tables(page)
             table_rects = [fitz.Rect(table.bbox) for table in tables]
             page_text = _extract_page_text_without_tables(page, table_rects)
             if len(page_text.split()) < 8 and ocr_enabled:
@@ -116,7 +120,6 @@ def extract_pdf(
                     )
 
     if not chunks and ocr_enabled:
-        # A second pass makes OCR useful even when every page had unusual layout.
         with fitz.open(Path(path)) as doc:
             for page_number, page in enumerate(doc, start=1):
                 ocr_text = _ocr_page_text(page)
@@ -173,7 +176,6 @@ class HybridIndex:
         sparse_scores = np.asarray(self.bm25.get_scores(tokenize(query)), dtype=np.float32)
         sparse_rank = np.argsort(-sparse_scores)[:sparse_k].tolist()
 
-        # Reciprocal Rank Fusion avoids needing to calibrate BM25 and cosine scores.
         fused: dict[int, float] = {}
         for rank, idx in enumerate(dense_rank, start=1):
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (60.0 + rank)

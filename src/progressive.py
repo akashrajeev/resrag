@@ -78,8 +78,6 @@ class FastLexicalIndex:
         cleaned = query.strip()
         if not cleaned or not self.chunks or self.bm25 is None:
             return []
-        start = fitz.TOOLS.mupdf_display_errors  # type: ignore[attr-defined]
-        del start
         if self.word_count <= self.full_text_word_limit:
             selected = self.chunks
         else:
@@ -102,9 +100,7 @@ class LongDocumentHybridIndex(UniversalHybridIndex):
 
     def __init__(self, *args: Any, long_document_pages: int | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
-        self.long_document_pages = int(
-            long_document_pages or os.getenv("LONG_DOCUMENT_PAGES", "80")
-        )
+        self.long_document_pages = int(long_document_pages or os.getenv("LONG_DOCUMENT_PAGES", "80"))
         self.page_to_ids: dict[int, list[int]] = {}
         self.page_names: list[int] = []
         self.page_centroids: np.ndarray | None = None
@@ -147,15 +143,17 @@ class LongDocumentHybridIndex(UniversalHybridIndex):
         query: str,
         broad: bool,
     ) -> list[int]:
-        expanded = list(super()._expand(
-            child_candidates,
-            query_embedding,
-            dense_scores,
-            sparse_scores,
-            fused,
-            query,
-            broad,
-        ))
+        expanded = list(
+            super()._expand(
+                child_candidates,
+                query_embedding,
+                dense_scores,
+                sparse_scores,
+                fused,
+                query,
+                broad,
+            )
+        )
         if not self.is_long_document or self.page_centroids is None or self.page_bm25 is None:
             return expanded
 
@@ -229,7 +227,7 @@ class ProgressiveIndexManager:
             return job
         try:
             job.full_index = job.future.result()
-        except Exception as exc:  # pragma: no cover - exercised by runtime failures
+        except Exception as exc:  # pragma: no cover - runtime-only failure path
             job.error = str(exc)
         return job
 

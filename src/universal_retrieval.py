@@ -14,8 +14,8 @@ from .resrag import Chunk
 from .text_utils import tokenize
 
 
-# Query-side breadth detection is domain-neutral: it describes the information
-# shape requested by the user, not the type of document being searched.
+# Domain-neutral query breadth detection. It describes the shape of the
+# requested answer rather than assuming anything about the PDF's subject.
 _BROAD_QUERY_RE = re.compile(
     r"^(?:what are|which are|what kinds|what types|list|name|summarize|overview|"
     r"give me an overview|give an overview|describe|compare|how many)\b",
@@ -28,12 +28,13 @@ _BROAD_WORDS = {
 
 
 class UniversalHybridIndex:
-    """Fast hybrid retrieval with document-discovered parent/child structure.
+    """Low-latency hybrid retrieval with document-discovered parent/child groups.
 
-    Each child chunk is indexed together with its local structural context
-    (detected section name + page). Retrieval happens at child level, then
-    parent/sibling evidence is reconstructed before optional reranking.
-    No document-domain vocabulary is required.
+    Child chunks are indexed with their own structural context (section/page).
+    At query time, dense + BM25 retrieval finds precise evidence, while a
+    precomputed group embedding identifies the relevant parent context. The
+    engine then reconstructs sibling evidence from that parent. No document
+    type or domain taxonomy is embedded in the algorithm.
     """
 
     def __init__(
@@ -64,20 +65,20 @@ class UniversalHybridIndex:
         self.last_latency: dict[str, float] = {}
         self.last_rerank_mode = "off"
         self.last_query_profile = "focused"
-        self.last_evidence_groups: int = 0
+        self.last_evidence_groups = 0
 
     @staticmethod
     def _group_key(chunk: Chunk) -> str:
-        """Use the document's own discovered section, else a page fallback."""
+        """Use a section discovered from the PDF; otherwise use a page group."""
         return chunk.section.strip() or f"__page_{chunk.page}"
 
     @staticmethod
     def _contextual_text(chunk: Chunk) -> str:
-        """Keep structural metadata in the searchable representation.
+        """Preserve structural context for both dense and lexical retrieval.
 
-        This fixes a subtle failure mode in hierarchical RAG: headings may be
-        removed from body chunks during parsing, making exact queries for a
-        section impossible to retrieve. The UI still displays only chunk.text.
+        This is a deterministic version of contextual retrieval: section/page
+        information is prepended during indexing, while the original chunk is
+        still shown to the user and sent to the generator.
         """
         prefix: list[str] = []
         if chunk.section.strip():
@@ -96,8 +97,6 @@ class UniversalHybridIndex:
             return "coverage"
         if re.search(r"\b(?:has|have|includes|contains|consists of)\b", normalized):
             return "coverage"
-        # Plural noun phrasing often asks for several evidence units. This is
-        # intentionally generic rather than tied to any document category.
         words = normalized.rstrip("?").split()
         if words and re.search(r"s$", words[-1]) and len(words) <= 8:
             return "coverage"
@@ -141,68 +140,116 @@ class UniversalHybridIndex:
         self.group_centroids = np.asarray(centroids, dtype=np.float32)
         self.last_latency = {"index_build_ms": (perf_counter() - start) * 1000.0}
 
-    def _expand_groups(
+    def _group_rank(
         self,
+        query: str,
+        query_embedding: np.ndarray,
+        dense_scores: np.ndarray,
+        sparse_scores: np.ndarray,
+        fused: dict[int, float],
+    ) -> list[str]:
+        """Rank discovered groups by semantic fit + strongest child evidence.
+
+        Exact overlap with a group's actual discovered heading is only a small
+        boost. Otherwise the group centroid and child relevance drive the rank,
+        allowing arbitrary section names such as "Selected Work" or "Methodology".
+        """
+        if not self.group_names or self.group_centroids is None:
+            return []
+
+        group_semantic = self.group_centroids @ query_embedding
+        query_tokens = set(tokenize(query))
+        scored: list[tuple[float, str]] = []
+        for group_index, group in enumerate(self.group_names):
+            ids = self.group_to_ids[group]
+            child_dense = max((float(dense_scores[idx]) for idx in ids), default=0.0)
+            child_fused = max((fused.get(idx, 0.0) for idx in ids), default=0.0)
+            group_tokens = set(tokenize(group.replace("__page_", "")))
+            lexical_overlap = len(query_tokens & group_tokens) / max(len(query_tokens), 1)
+            score = (
+                0.58 * float(group_semantic[group_index])
+                + 0.24 * child_dense
+                + 0.14 * child_fused
+                + 0.04 * lexical_overlap
+            )
+            scored.append((score, group))
+        scored.sort(reverse=True)
+        return [group for _, group in scored]
+
+    def _select_candidates(
+        self,
+        query: str,
+        query_embedding: np.ndarray,
         candidate_ids: list[int],
         fused: dict[int, float],
         dense_scores: np.ndarray,
         sparse_scores: np.ndarray,
         broad: bool,
-    ) -> tuple[list[int], int]:
-        dense_lookup = {idx: rank for rank, idx in enumerate(self._top_k(dense_scores, len(dense_scores)), start=1)}
-        sparse_lookup = {idx: rank for rank, idx in enumerate(self._top_k(sparse_scores, len(sparse_scores)), start=1)}
+        effective_k: int,
+    ) -> list[int]:
+        group_rank = self._group_rank(query, query_embedding, dense_scores, sparse_scores, fused)
+        if not group_rank:
+            return candidate_ids[: max(effective_k, 4)]
 
-        def score(idx: int) -> float:
-            return (
-                fused.get(idx, 0.0)
-                + 0.02 / (60 + dense_lookup.get(idx, 100000))
-                + 0.02 / (60 + sparse_lookup.get(idx, 100000))
-            )
-
-        # Seed parents from independent child retrieval results.
+        candidate_set = set(candidate_ids)
         selected_groups: list[str] = []
-        for idx in candidate_ids:
-            group = self._group_key(self.chunks[idx])
-            if group not in selected_groups:
-                selected_groups.append(group)
-            if len(selected_groups) >= (6 if broad else 3):
-                break
+        if broad:
+            # A strong top-group match gets most of the evidence budget. This
+            # is what turns "what are the ...?" into parent-level coverage while
+            # still allowing overview questions to span multiple groups.
+            top_group = group_rank[0]
+            top_group_tokens = set(tokenize(top_group.replace("__page_", "")))
+            query_tokens = set(tokenize(query))
+            exact_group_match = bool(query_tokens & top_group_tokens)
+            selected_groups.append(top_group)
+            if not exact_group_match:
+                selected_groups.extend(group_rank[1:3])
+            else:
+                selected_groups.extend(group_rank[1:2])
+        else:
+            selected_groups = group_rank[:3]
 
         expanded: list[int] = []
         for group in selected_groups:
-            ids = sorted(self.group_to_ids[group], key=score, reverse=True)
-            limit = len(ids) if broad else min(len(ids), 3)
-            expanded.extend(ids[:limit])
+            ids = self.group_to_ids[group]
+            ranked = sorted(
+                ids,
+                key=lambda idx: (
+                    fused.get(idx, 0.0),
+                    float(dense_scores[idx]),
+                    float(sparse_scores[idx]),
+                ),
+                reverse=True,
+            )
+            if broad:
+                limit = len(ranked)
+            else:
+                limit = min(len(ranked), 3)
+            expanded.extend(ranked[:limit])
 
-        # Also add physical neighbors for chunks in ungrouped/page groups;
-        # this recovers continuation text without requiring headings.
-        if not broad:
-            for idx in candidate_ids[:3]:
-                page = self.chunks[idx].page
-                nearby = [j for j, chunk in enumerate(self.chunks) if chunk.page == page]
-                if idx in nearby:
-                    position = nearby.index(idx)
-                    expanded.extend(nearby[max(0, position - 1) : position + 2])
+        expanded.extend(candidate_ids)
+        expanded = list(dict.fromkeys(expanded))
 
-        ordered = list(dict.fromkeys(expanded + candidate_ids))
-
-        # For coverage queries, diversify by parent first so the evidence bundle
-        # does not get dominated by a single highly similar child chunk.
         if broad:
-            diverse: list[int] = []
-            seen_groups: set[str] = set()
-            for idx in sorted(ordered, key=score, reverse=True):
-                group = self._group_key(self.chunks[idx])
-                if group not in seen_groups:
-                    diverse.append(idx)
-                    seen_groups.add(group)
-            for idx in sorted(ordered, key=score, reverse=True):
-                if idx not in diverse:
-                    diverse.append(idx)
-            ordered = diverse
+            # Allocate about 70% of the final bundle to the best semantic
+            # parent and the remainder across secondary groups.
+            primary = self.group_to_ids[group_rank[0]]
+            primary_ranked = sorted(
+                [idx for idx in expanded if idx in primary],
+                key=lambda idx: (fused.get(idx, 0.0), float(dense_scores[idx])),
+                reverse=True,
+            )
+            primary_budget = min(len(primary_ranked), max(2, int(np.ceil(effective_k * 0.7))))
+            ordered = primary_ranked[:primary_budget]
+            remaining = [idx for idx in expanded if idx not in ordered]
+            ordered.extend(remaining)
+            return ordered
 
-        target_k = max(6 if broad else 4, int(os.getenv("RETRIEVAL_FINAL_K", "4")))
-        return ordered, target_k
+        return sorted(
+            expanded,
+            key=lambda idx: (fused.get(idx, 0.0), float(dense_scores[idx]), float(sparse_scores[idx])),
+            reverse=True,
+        )
 
     def retrieve(
         self,
@@ -215,6 +262,7 @@ class UniversalHybridIndex:
     ) -> list[dict[str, Any]]:
         if not query.strip() or final_k <= 0:
             self.last_latency = {}
+            self.last_query_profile = "focused"
             return []
         if rerank_mode not in {"auto", "on", "off"}:
             raise ValueError("rerank_mode must be one of: auto, on, off")
@@ -255,31 +303,35 @@ class UniversalHybridIndex:
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (60.0 + rank)
 
         child_candidates = [idx for idx, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)]
-        expanded_ids, effective_k = self._expand_groups(
+        effective_k = max(final_k, 6 if broad else 4)
+        expanded = self._select_candidates(
+            query,
+            q,
             child_candidates,
             fused,
             dense_scores,
             sparse_scores,
             broad,
+            effective_k,
         )
 
-        candidates: list[dict[str, Any]] = []
         candidate_window = max(self.rerank_candidate_k, effective_k * 2, 12 if broad else 8)
-        for idx in expanded_ids[:candidate_window]:
-            candidates.append(
-                {
-                    "chunk": self.chunks[idx],
-                    "hybrid_score": fused.get(idx, 0.0),
-                    "dense_score": float(dense_scores[idx]),
-                    "bm25_score": float(sparse_scores[idx]),
-                }
-            )
+        candidates = [
+            {
+                "chunk": self.chunks[idx],
+                "hybrid_score": fused.get(idx, 0.0),
+                "dense_score": float(dense_scores[idx]),
+                "bm25_score": float(sparse_scores[idx]),
+            }
+            for idx in expanded[:candidate_window]
+        ]
 
+        # Rerank coverage queries too, but only over the compact reconstructed
+        # parent bundle. This recovers quality without reranking the full index.
         should_rerank = bool(
             self.reranker
             and len(candidates) > effective_k
             and rerank_mode != "off"
-            and (rerank_mode == "on" or not broad)
         )
         rerank_start = perf_counter()
         if should_rerank:
@@ -297,17 +349,20 @@ class UniversalHybridIndex:
             self.last_rerank_mode = "off"
         rerank_ms = (perf_counter() - rerank_start) * 1000.0
 
-        # For broad questions, select a compact but coverage-oriented bundle.
+        group_rank = self._group_rank(query, q, dense_scores, sparse_scores, fused)
         selected: list[dict[str, Any]] = []
-        seen_groups: set[str] = set()
-        if broad:
-            for item in candidates:
-                group = self._group_key(item["chunk"])
-                if group not in seen_groups or len(selected) < min(effective_k, 2):
-                    selected.append(item)
-                    seen_groups.add(group)
-                if len(selected) >= effective_k:
-                    break
+        if broad and group_rank:
+            primary_group = group_rank[0]
+            primary_items = [
+                item for item in candidates if self._group_key(item["chunk"]) == primary_group
+            ]
+            secondary_items = [
+                item for item in candidates if self._group_key(item["chunk"]) != primary_group
+            ]
+            # Preserve most of the evidence from the best parent group.
+            primary_budget = min(len(primary_items), max(3, int(np.ceil(effective_k * 0.7))))
+            selected.extend(primary_items[:primary_budget])
+            selected.extend(secondary_items[: max(0, effective_k - len(selected))])
             if len(selected) < effective_k:
                 selected.extend(item for item in candidates if item not in selected)
                 selected = selected[:effective_k]

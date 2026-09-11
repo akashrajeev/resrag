@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
-import pymupdf as fitz
 import numpy as np
+import pymupdf as fitz
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
@@ -129,7 +131,7 @@ def extract_pdf(
 
 
 class HybridIndex:
-    """Dense + BM25 hybrid index with optional cross-encoder reranking."""
+    """Dense + BM25 hybrid index with adaptive cross-encoder reranking."""
 
     def __init__(
         self,
@@ -138,18 +140,33 @@ class HybridIndex:
         *,
         embedder: SentenceTransformer | None = None,
         reranker: CrossEncoder | None = None,
+        rerank_skip_margin: float | None = None,
+        rerank_candidate_k: int | None = None,
     ) -> None:
         self.embedding_model_name = embedding_model
         self.reranker_model_name = reranker_model
         self.embedder = embedder or SentenceTransformer(embedding_model)
         self.reranker = reranker or (CrossEncoder(reranker_model) if reranker_model else None)
+        self.rerank_skip_margin = (
+            float(rerank_skip_margin)
+            if rerank_skip_margin is not None
+            else float(os.getenv("RERANK_SKIP_MARGIN", "0.12"))
+        )
+        self.rerank_candidate_k = (
+            int(rerank_candidate_k)
+            if rerank_candidate_k is not None
+            else int(os.getenv("RERANK_CANDIDATE_K", "8"))
+        )
         self.chunks: list[Chunk] = []
         self.embeddings: np.ndarray | None = None
         self.bm25: BM25Okapi | None = None
+        self.last_latency: dict[str, float] = {}
+        self.last_rerank_mode: str = "off"
 
     def build(self, chunks: list[Chunk]) -> None:
         if not chunks:
             raise ValueError("No usable text or tables could be extracted from the PDF.")
+        t0 = perf_counter()
         self.chunks = chunks
         self.embeddings = self.embedder.encode(
             [c.text for c in chunks],
@@ -158,34 +175,98 @@ class HybridIndex:
             show_progress_bar=False,
         ).astype(np.float32)
         self.bm25 = BM25Okapi([tokenize(c.text) for c in chunks])
+        self.last_latency = {"index_build_ms": (perf_counter() - t0) * 1000.0}
+
+    @staticmethod
+    def _top_k(scores: np.ndarray, k: int) -> list[int]:
+        if k >= len(scores):
+            return np.argsort(-scores).tolist()
+        partition = np.argpartition(scores, -k)[-k:]
+        return partition[np.argsort(-scores[partition])].tolist()
+
+    def _should_rerank(
+        self,
+        candidate_ids: list[int],
+        dense_rank: list[int],
+        sparse_rank: list[int],
+        fused: dict[int, float],
+        final_k: int,
+        mode: str,
+    ) -> bool:
+        if mode == "on":
+            return bool(self.reranker and len(candidate_ids) > final_k)
+        if mode == "off" or not self.reranker or len(candidate_ids) <= final_k:
+            return False
+        best = candidate_ids[0]
+        second = candidate_ids[1] if len(candidate_ids) > 1 else best
+        if best == second:
+            return False
+        agreement = best in dense_rank[:3] and best in sparse_rank[:3]
+        relative_margin = (fused[best] - fused[second]) / max(abs(fused[best]), 1e-9)
+        return not (agreement and relative_margin >= self.rerank_skip_margin)
 
     def retrieve(
         self,
         query: str,
-        dense_k: int = 16,
-        sparse_k: int = 16,
-        final_k: int = 6,
+        dense_k: int = 12,
+        sparse_k: int = 12,
+        final_k: int = 4,
+        *,
+        rerank_mode: str = "auto",
     ) -> list[dict[str, Any]]:
         if not query.strip() or final_k <= 0:
+            self.last_latency = {}
+            self.last_rerank_mode = "off"
             return []
+        if rerank_mode not in {"auto", "on", "off"}:
+            raise ValueError("rerank_mode must be one of: auto, on, off")
         if not self.chunks or self.embeddings is None or self.bm25 is None:
             raise RuntimeError("Index has not been built.")
 
+        total_start = perf_counter()
         dense_k = min(max(dense_k, 1), len(self.chunks))
         sparse_k = min(max(sparse_k, 1), len(self.chunks))
-        q = self.embedder.encode([query], normalize_embeddings=True, convert_to_numpy=True)[0]
-        dense_scores = self.embeddings @ q
-        dense_rank = np.argsort(-dense_scores)[:dense_k].tolist()
-        sparse_scores = np.asarray(self.bm25.get_scores(tokenize(query)), dtype=np.float32)
-        sparse_rank = np.argsort(-sparse_scores)[:sparse_k].tolist()
+        final_k = min(max(final_k, 1), len(self.chunks))
 
+        def encode_query():
+            return self.embedder.encode([query], normalize_embeddings=True, convert_to_numpy=True)[0]
+
+        def score_sparse():
+            return np.asarray(self.bm25.get_scores(tokenize(query)), dtype=np.float32)
+
+        parallel_start = perf_counter()
+        # Dense query encoding and BM25 scoring are independent and can overlap.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            dense_future = pool.submit(encode_query)
+            sparse_future = pool.submit(score_sparse)
+            q = dense_future.result()
+            sparse_scores = sparse_future.result()
+        parallel_ms = (perf_counter() - parallel_start) * 1000.0
+
+        search_start = perf_counter()
+        dense_scores = self.embeddings @ q
+        dense_rank = self._top_k(dense_scores, dense_k)
+        sparse_rank = self._top_k(sparse_scores, sparse_k)
+        search_ms = (perf_counter() - search_start) * 1000.0
+
+        fusion_start = perf_counter()
         fused: dict[int, float] = {}
         for rank, idx in enumerate(dense_rank, start=1):
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (60.0 + rank)
         for rank, idx in enumerate(sparse_rank, start=1):
             fused[idx] = fused.get(idx, 0.0) + 1.0 / (60.0 + rank)
-
         candidate_ids = [idx for idx, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)]
+        fusion_ms = (perf_counter() - fusion_start) * 1000.0
+
+        rerank_start = perf_counter()
+        should_rerank = self._should_rerank(
+            candidate_ids,
+            dense_rank,
+            sparse_rank,
+            fused,
+            final_k,
+            rerank_mode,
+        )
         candidates = [
             {
                 "chunk": self.chunks[idx],
@@ -193,14 +274,27 @@ class HybridIndex:
                 "dense_score": float(dense_scores[idx]),
                 "bm25_score": float(sparse_scores[idx]),
             }
-            for idx in candidate_ids[: max(final_k * 4, 16)]
+            for idx in candidate_ids[: max(final_k * 2, self.rerank_candidate_k)]
         ]
 
-        if self.reranker and candidates:
-            pairs = [(query, item["chunk"].text) for item in candidates]
+        if should_rerank and candidates:
+            rerank_candidates = candidates[: min(self.rerank_candidate_k, len(candidates))]
+            pairs = [(query, item["chunk"].text) for item in rerank_candidates]
             scores = self.reranker.predict(pairs, show_progress_bar=False)
-            for item, score in zip(candidates, scores, strict=True):
+            for item, score in zip(rerank_candidates, scores, strict=True):
                 item["rerank_score"] = float(score)
-            candidates.sort(key=lambda item: item["rerank_score"], reverse=True)
+            rerank_candidates.sort(key=lambda item: item["rerank_score"], reverse=True)
+            candidates = rerank_candidates + candidates[len(rerank_candidates):]
+            self.last_rerank_mode = "on"
+        else:
+            self.last_rerank_mode = "off"
+        rerank_ms = (perf_counter() - rerank_start) * 1000.0
 
+        self.last_latency = {
+            "query_parallel_ms": parallel_ms,
+            "search_ms": search_ms,
+            "fusion_ms": fusion_ms,
+            "rerank_ms": rerank_ms,
+            "total_retrieval_ms": (perf_counter() - total_start) * 1000.0,
+        }
         return candidates[:final_k]

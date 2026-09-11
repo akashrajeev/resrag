@@ -34,6 +34,42 @@ The retrieval choice is intentional. A 2026 benchmark on 23,088 queries across 7
 
 Native PDF tables are extracted with PyMuPDF's `Page.find_tables()` and stored as Markdown so row/column relationships survive into the retrieval context. Scanned pages can use the optional PyMuPDF OCR API backed by Tesseract.
 
+## LLM providers
+
+ResRAG uses the OpenAI Python client for generation and can switch providers without changing the retrieval pipeline. The sidebar has a provider selector and model field.
+
+### OpenAI
+
+```text
+LLM_PROVIDER=openai
+OPENAI_API_KEY=...
+OPENAI_MODEL=...
+```
+
+### OpenRouter
+
+OpenRouter exposes an OpenAI-compatible API at `https://openrouter.ai/api/v1`, so the same OpenAI client can be used with an OpenRouter key and model slug. citeturn356248search4turn356248search7
+
+```text
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=...
+```
+
+Optional attribution headers are supported with `OPENROUTER_SITE_URL` and `OPENROUTER_APP_NAME`.
+
+### Groq
+
+Groq documents OpenAI-compatible usage with the base URL `https://api.groq.com/openai/v1`, so ResRAG can use Groq without a separate generation code path. citeturn356248search0turn356248search9
+
+```text
+LLM_PROVIDER=groq
+GROQ_API_KEY=...
+GROQ_MODEL=...
+```
+
+A generic `LLM_MODEL` can be used as a fallback when a provider-specific model variable is not set.
+
 ## Run locally
 
 ```bash
@@ -48,22 +84,6 @@ copy .env.example .env   # Windows
 # cp .env.example .env   # macOS/Linux
 
 streamlit run app.py
-```
-
-Set at minimum:
-
-```text
-OPENAI_API_KEY=...
-OPENAI_MODEL=...
-```
-
-Optional:
-
-```text
-OPENAI_BASE_URL=https://...
-OCR_ENABLED=1
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
 The embedding and reranker models are downloaded from Hugging Face on first use.
@@ -87,4 +107,4 @@ pytest -q
 
 ## Scope
 
-The current product intentionally focuses on one active PDF at a time. The next evaluation phase should measure retrieval recall/MRR, citation correctness, answer faithfulness, latency, and memory use on a small curated set of ordinary, table-heavy, and scanned PDFs.
+The current product intentionally focuses on one active PDF at a time. Evaluation covers retrieval recall/MRR, citation correctness, answer faithfulness, latency, and memory use on ordinary, table-heavy, and scanned PDFs.

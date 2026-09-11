@@ -27,19 +27,21 @@ def validate_citations(answer: str, source_pages: set[int]) -> CitationCheck:
     )
 
 
-def build_context(retrieved: list[dict], max_chars_per_source: int = 1400) -> str:
-    """Build a compact, explicitly structured evidence context for low-latency generation."""
+def build_context(retrieved: list[dict], max_chars_per_source: int = 1000) -> str:
+    """Build compact, structured evidence with section metadata for low-latency grounded generation."""
     sections: list[str] = []
     for index, item in enumerate(retrieved, start=1):
         chunk = item["chunk"]
         text = chunk.text.strip()
         if len(text) > max_chars_per_source:
             text = text[:max_chars_per_source].rstrip() + "…"
+        section = getattr(chunk, "section", "") or "Unsectioned"
         sections.append(
             f"SOURCE {index}\n"
             f"Page: {chunk.page}\n"
+            f"Section: {section}\n"
             f"Type: {chunk.kind}\n"
-            f"{text}"
+            f"Content:\n{text}"
         )
     return "\n\n---\n\n".join(sections)
 

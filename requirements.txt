@@ -1,5 +1,5 @@
 streamlit>=1.49,<2
-pymupdf>=1.26,<2
+pymupdf>=1.28,<2
 numpy>=2.0,<3
 rank-bm25>=0.2.2
 sentence-transformers>=5,<6

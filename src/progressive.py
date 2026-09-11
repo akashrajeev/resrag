@@ -91,12 +91,7 @@ class FastLexicalIndex:
 
 
 class LongDocumentHybridIndex(UniversalHybridIndex):
-    """UniversalHybridIndex with page-level coarse routing for long PDFs.
-
-    Page retrieval is an intermediate layer between document-wide dense/sparse
-    search and chunk reranking. It uses only structures already present in the
-    index, so no extra query embedding call is required.
-    """
+    """UniversalHybridIndex with page-level coarse routing for long PDFs."""
 
     def __init__(self, *args: Any, long_document_pages: int | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -189,7 +184,7 @@ class ProgressiveJob:
     digest: str
     fast_index: FastLexicalIndex
     future: Future
-    full_index: LongDocumentHybridIndex | None = None
+    full_index: UniversalHybridIndex | None = None
     error: str | None = None
 
 
@@ -209,12 +204,7 @@ class ProgressiveIndexManager:
 
         chunks = fast_extract_pdf_bytes(pdf_bytes)
         fast_index = FastLexicalIndex(chunks)
-        future = self.executor.submit(
-            _build_full_index,
-            pdf_bytes,
-            embedding_model,
-            reranker_model,
-        )
+        future = self.executor.submit(_build_full_index, pdf_bytes, embedding_model, reranker_model)
         job = ProgressiveJob(digest, fast_index, future)
         self.jobs[digest] = job
         return job
@@ -239,13 +229,17 @@ def _build_full_index(
     pdf_bytes: bytes,
     embedding_model: str,
     reranker_model: str | None,
-) -> LongDocumentHybridIndex:
+) -> UniversalHybridIndex:
     fd, temp_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     try:
         Path(temp_path).write_bytes(pdf_bytes)
         chunks = extract_pdf(temp_path)
-        index = LongDocumentHybridIndex(
+        # Dynamic import avoids a module cycle while keeping the page-first
+        # subclass isolated from the generic ingestion manager.
+        from .long_retrieval import PageFirstLongDocumentIndex
+
+        index = PageFirstLongDocumentIndex(
             embedding_model,
             reranker_model or None,
             embedder=_load_embedder(embedding_model),

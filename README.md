@@ -34,7 +34,7 @@ PDF upload
 
 The design separates time-to-first-answer from time-to-full-index. This follows the demand-side/deferred-ingestion direction explored by recent document QA work: lightweight metadata and lexical indexing can locate relevant content first, while expensive understanding is performed only when it is available or needed.
 
-For long documents, ResRAG adds page-level retrieval between document-wide child retrieval and reranking. Recent 2026 long-document work reports that page-level retrieval can improve within-document recall, while HiKEY and H-RAG show that hierarchical parent/child retrieval helps recover fragmented evidence across long documents. citeturn120036academia1turn960952academia12turn960952search0turn526949search1
+For long documents, ResRAG adds page-level retrieval between document-wide child retrieval and reranking. Recent 2026 long-document work reports that page-level retrieval can improve within-document recall, while HiKEY and H-RAG show that hierarchical parent/child retrieval helps recover fragmented evidence across long documents.
 
 ## Retrieval
 

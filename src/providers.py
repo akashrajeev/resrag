@@ -84,8 +84,14 @@ def get_provider_client(provider: str, *, model_override: str | None = None) -> 
     return OpenAI(**kwargs), get_provider_model(provider, model_override)
 
 
-def get_completion_extras(provider: str) -> dict[str, object]:
+def get_completion_extras(provider: str, model: str | None = None) -> dict[str, object]:
     """Provider-specific request hints focused on latency."""
+    extra_body: dict[str, object] = {}
     if provider == "openrouter":
-        return {"extra_body": {"provider": {"sort": "latency"}}}
-    return {}
+        extra_body["provider"] = {"sort": "latency"}
+    if provider == "groq" and model and "gpt-oss" in model.lower():
+        # Simple PDF QA rarely needs medium/high reasoning. Low effort retains
+        # reasoning capability while avoiding unnecessary reasoning tokens.
+        extra_body["reasoning_effort"] = "low"
+        extra_body["include_reasoning"] = False
+    return {"extra_body": extra_body} if extra_body else {}

@@ -28,7 +28,7 @@ header {background:transparent!important;}
 section[data-testid="stSidebar"] {background:#f7f7f8; border-right:1px solid #e5e5e5;}
 section[data-testid="stSidebar"] > div {padding-top:1rem;}
 .block-container {max-width:1000px; padding-top:1.2rem; padding-bottom:7rem;}
-.topbar {display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;}
+.topbar {display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;gap:16px;}
 .brand {font-weight:650;font-size:17px;letter-spacing:-.2px;}
 .brand-sub {color:#777;font-size:12px;margin-top:2px;}
 .doc-pill {border:1px solid #e5e5e5;background:#fafafa;border-radius:999px;padding:7px 11px;font-size:12px;color:#666;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -38,7 +38,8 @@ section[data-testid="stSidebar"] > div {padding-top:1rem;}
 .answer {line-height:1.62;}
 .source-card {border:1px solid #e7e7e7;border-radius:12px;padding:12px 14px;background:#fbfbfb;margin-bottom:10px;}
 .source-meta {font-size:11px;color:#777;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em;}
-.source-text {font-size:13px;line-height:1.55;color:#414141;}
+.source-text {font-size:13px;line-height:1.55;color:#414141;white-space:pre-wrap;}
+.status-chip {display:inline-block;font-size:11px;color:#666;background:#f3f3f3;border-radius:999px;padding:3px 7px;margin-left:5px;}
 .small-muted {font-size:12px;color:#7b7b7b;}
 .stChatMessage {padding-top:.6rem;padding-bottom:.6rem;}
 .stChatMessage[data-testid="user-message"] {background:transparent;}
@@ -83,10 +84,13 @@ def get_client() -> OpenAI:
 def generate_answer(question: str, retrieved: list[dict]) -> str:
     if not OPENAI_MODEL:
         raise RuntimeError("Add OPENAI_MODEL to your .env file.")
-    context = "\n\n---\n\n".join(f"[Page {x['chunk'].page}]\n{x['chunk'].text}" for x in retrieved)
+    context = "\n\n---\n\n".join(
+        f"[Page {x['chunk'].page} · {x['chunk'].kind}]\n{x['chunk'].text}" for x in retrieved
+    )
     system = """You answer questions using only the supplied PDF excerpts.
 Do not use outside knowledge to fill gaps. If the excerpts do not support an answer, say so.
 Every factual statement should include a page citation in the form [Page N].
+When a table excerpt supports a number or comparison, preserve the table's meaning and do not invent values.
 Do not invent citations, facts, numbers, quotations, or conclusions.
 Write naturally and directly, without mentioning the retrieval process unless useful."""
     response = get_client().chat.completions.create(
@@ -105,8 +109,11 @@ def render_sources(sources: list[dict]):
         for item in sources:
             chunk = item["chunk"]
             score = item.get("rerank_score", item.get("hybrid_score", 0))
+            label = chunk.kind.capitalize()
+            if chunk.kind == "table":
+                label = "Table"
             st.markdown(
-                f"<div class='source-card'><div class='source-meta'>Page {chunk.page} · {score:.3f}</div><div class='source-text'>{chunk.text}</div></div>",
+                f"<div class='source-card'><div class='source-meta'>Page {chunk.page} · {label} · {score:.3f}</div><div class='source-text'>{chunk.text}</div></div>",
                 unsafe_allow_html=True,
             )
 
@@ -129,14 +136,22 @@ with st.sidebar:
                 st.session_state.index = index
                 st.session_state.doc_name = uploaded.name
                 st.session_state.messages = []
+                table_count = sum(c.kind == "table" for c in chunks)
+                ocr_count = sum(c.kind == "ocr" for c in chunks)
                 st.success(f"Ready · {len(chunks)} passages")
+                if table_count:
+                    st.caption(f"Detected {table_count} native table passage{'s' if table_count != 1 else ''}.")
+                if ocr_count:
+                    st.caption(f"OCR fallback produced {ocr_count} passage{'s' if ocr_count != 1 else ''}.")
+                elif os.getenv("OCR_ENABLED", "0") != "1":
+                    st.caption("Scanned pages: enable OCR_ENABLED=1 to add an OCR fallback.")
             except Exception as exc:
                 st.error(f"Couldn't read this PDF: {exc}")
             finally:
                 Path(path).unlink(missing_ok=True)
     st.divider()
     st.markdown("**About**")
-    st.markdown("Hybrid retrieval with BM25 + dense embeddings, fused with RRF and refined by a cross-encoder.")
+    st.markdown("Hybrid BM25 + dense retrieval, RRF fusion, and cross-encoder reranking, with page-aware text and native tables.")
     st.caption(f"Embedding · {EMBEDDING_MODEL}\nReranker · {RERANKER_MODEL}")
     if "index" in st.session_state and st.button("Clear document", use_container_width=True):
         for key in ("index", "doc_name", "messages"):
@@ -170,7 +185,7 @@ else:
         with st.chat_message("assistant"):
             try:
                 with st.spinner("Thinking…"):
-                    sources = st.session_state.index.retrieve(question, dense_k=12, sparse_k=12, final_k=6)
+                    sources = st.session_state.index.retrieve(question, dense_k=16, sparse_k=16, final_k=6)
                     answer = generate_answer(question, sources)
                 st.markdown(answer, unsafe_allow_html=True)
                 render_sources(sources)

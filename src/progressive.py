@@ -67,7 +67,7 @@ class FastLexicalIndex:
         self.chunks = chunks
         self.word_count = sum(len(chunk.text.split()) for chunk in chunks)
         limit = int(full_text_word_limit or os.getenv("FAST_FULL_TEXT_WORDS", "5000"))
-        self.full_text_word_limit = max(500, limit)
+        self.full_text_word_limit = max(1, limit)
         self.bm25 = BM25Okapi([tokenize(chunk.text) for chunk in chunks]) if chunks else None
         self.last_rerank_mode = "off"
         self.last_query_profile = "fast"

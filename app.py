@@ -24,7 +24,7 @@ RERANK_MODE = os.getenv("RERANK_MODE", "auto").strip().lower()
 RETRIEVAL_FINAL_K = max(1, int(os.getenv("RETRIEVAL_FINAL_K", "4")))
 RETRIEVAL_DENSE_K = max(1, int(os.getenv("RETRIEVAL_DENSE_K", "12")))
 RETRIEVAL_SPARSE_K = max(1, int(os.getenv("RETRIEVAL_SPARSE_K", "12")))
-MAX_OUTPUT_TOKENS = max(64, int(os.getenv("MAX_OUTPUT_TOKENS", "256")))
+MAX_OUTPUT_TOKENS = max(64, int(os.getenv("MAX_OUTPUT_TOKENS", "192")))
 SHOW_LATENCY = os.getenv("SHOW_LATENCY", "0") == "1"
 
 st.markdown(
@@ -110,7 +110,7 @@ def stream_answer(
 ):
     system, user_prompt = build_messages(question, retrieved, history)
     client, _ = get_provider_client(provider, model_override=model)
-    extras = get_completion_extras(provider)
+    extras = get_completion_extras(provider, model)
     response = client.chat.completions.create(
         model=model,
         temperature=0,

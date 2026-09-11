@@ -209,10 +209,6 @@ def extract_pdf(
     return chunks
 
 
-def _section_key(section: str) -> str:
-    return re.sub(r"\s+", " ", section.strip().lower())
-
-
 def _coverage_profile(query: str, sections: dict[str, list[int]]) -> tuple[str, list[str]]:
     tokens = set(tokenize(query))
     broad = len(tokens & COVERAGE_CUES) > 0 or len(tokens) <= 6
@@ -305,7 +301,9 @@ class HybridIndex:
         independent_agreement = bool(dense_rank and sparse_rank and dense_rank[0] == best and sparse_rank[0] == best)
         if independent_agreement:
             return False
-        relative_margin = (fused[best] - fused[second]) / max(abs(fused[best]), 1e-9)
+        best_score = fused.get(best, 0.0)
+        second_score = fused.get(second, 0.0)
+        relative_margin = (best_score - second_score) / max(abs(best_score), 1e-9)
         return relative_margin < self.rerank_skip_margin
 
     def _select_coverage_candidates(
@@ -338,8 +336,6 @@ class HybridIndex:
                 expanded.extend(self.section_to_ids.get(section, []))
             target_k = max(final_k, int(os.getenv("COVERAGE_FINAL_K", "8")))
         else:
-            # Overview queries should touch multiple sections instead of letting
-            # one semantically dense section dominate the entire answer.
             section_scores: list[tuple[float, str]] = []
             for section, ids in self.section_to_ids.items():
                 best = max((local_score(idx) for idx in ids), default=0.0)

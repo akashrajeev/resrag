@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import html
 import os
-import tempfile
-from pathlib import Path
 from time import perf_counter
 
 import streamlit as st
 from dotenv import load_dotenv
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from src.grounding import build_context, build_followup_query, validate_citations
+from src.progressive import ProgressiveIndexManager
 from src.providers import get_completion_extras, get_provider_client, get_provider_config, provider_keys
-from src.resrag import extract_pdf
-from src.universal_retrieval import UniversalHybridIndex
 
 load_dotenv()
 
@@ -27,6 +23,14 @@ RETRIEVAL_DENSE_K = max(1, int(os.getenv("RETRIEVAL_DENSE_K", "32")))
 RETRIEVAL_SPARSE_K = max(1, int(os.getenv("RETRIEVAL_SPARSE_K", "32")))
 MAX_OUTPUT_TOKENS = max(64, int(os.getenv("MAX_OUTPUT_TOKENS", "256")))
 SHOW_LATENCY = os.getenv("SHOW_LATENCY", "0") == "1"
+
+
+@st.cache_resource(show_spinner=False)
+def get_index_manager() -> ProgressiveIndexManager:
+    return ProgressiveIndexManager(max_workers=1)
+
+
+index_manager = get_index_manager()
 
 st.markdown(
     """
@@ -58,28 +62,6 @@ button[kind="primary"] {border-radius:10px;}
 )
 
 
-@st.cache_resource(show_spinner=False)
-def get_embedder(name: str):
-    backend = os.getenv("EMBEDDING_BACKEND", "torch").strip().lower()
-    if backend == "onnx":
-        return SentenceTransformer(name, backend="onnx")
-    return SentenceTransformer(name)
-
-
-@st.cache_resource(show_spinner=False)
-def get_reranker(name: str):
-    return CrossEncoder(name) if name else None
-
-
-def build_index(chunks):
-    return UniversalHybridIndex(
-        EMBEDDING_MODEL,
-        RERANKER_MODEL or None,
-        embedder=get_embedder(EMBEDDING_MODEL),
-        reranker=get_reranker(RERANKER_MODEL),
-    )
-
-
 def build_messages(question: str, retrieved: list[dict], history: list[dict]):
     context = build_context(retrieved)
     recent_history = "\n".join(
@@ -104,13 +86,7 @@ Keep the answer concise unless the question asks for detail."""
     return system, user_prompt
 
 
-def stream_answer(
-    question: str,
-    retrieved: list[dict],
-    history: list[dict],
-    provider: str,
-    model: str,
-):
+def stream_answer(question: str, retrieved: list[dict], history: list[dict], provider: str, model: str):
     system, user_prompt = build_messages(question, retrieved, history)
     client, _ = get_provider_client(provider, model_override=model)
     extras = get_completion_extras(provider, model)
@@ -156,6 +132,14 @@ def render_citation_status(answer: str, sources: list[dict]):
         st.caption("The answer did not include a page citation; review the source passages below.")
 
 
+def activate_job(job):
+    st.session_state.document_id = job.digest
+    st.session_state.doc_name = st.session_state.get("pending_doc_name", st.session_state.get("doc_name", "document.pdf"))
+    st.session_state.index = job.full_index or job.fast_index
+    st.session_state.index_mode = "full" if job.full_index is not None else "fast"
+    st.session_state.messages = []
+
+
 provider_slugs = provider_keys()
 provider_labels = {slug: get_provider_config(slug).name for slug in provider_slugs}
 configured_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
@@ -185,42 +169,52 @@ with st.sidebar:
     if uploaded:
         st.caption(uploaded.name)
         if st.button("Add to chat", type="primary", use_container_width=True):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded.getbuffer())
-                path = tmp.name
             try:
-                with st.spinner("Reading document…"):
-                    chunks = extract_pdf(path)
-                    index = build_index(chunks)
-                    index.build(chunks)
-                st.session_state.index = index
+                pdf_bytes = uploaded.getvalue()
+                upload_start = perf_counter()
+                job = index_manager.start(pdf_bytes, EMBEDDING_MODEL, RERANKER_MODEL or None)
+                st.session_state.pending_doc_name = uploaded.name
+                st.session_state.document_id = job.digest
                 st.session_state.doc_name = uploaded.name
+                st.session_state.index = job.full_index or job.fast_index
+                st.session_state.index_mode = "full" if job.full_index is not None else "fast"
                 st.session_state.messages = []
-                group_count = len(getattr(index, "group_to_ids", {}))
-                st.success(f"Ready · {len(chunks)} passages")
-                if group_count:
-                    st.caption(f"Discovered {group_count} document context group{'s' if group_count != 1 else ''} for retrieval.")
+                st.session_state.upload_ready_ms = (perf_counter() - upload_start) * 1000.0
+                if job.error:
+                    st.warning(f"Full indexing failed; fast document search remains available: {job.error}")
+                st.rerun()
             except Exception as exc:
-                st.error(f"Couldn't read this PDF: {exc}")
-            finally:
-                Path(path).unlink(missing_ok=True)
+                st.error(f"Couldn't open this PDF: {exc}")
+
+    active_job = index_manager.get(st.session_state.document_id) if st.session_state.get("document_id") else None
+    if active_job is not None:
+        if active_job.full_index is not None:
+            st.success("Full index ready")
+            if st.session_state.get("index_mode") != "full":
+                st.session_state.index = active_job.full_index
+                st.session_state.index_mode = "full"
+        elif active_job.error:
+            st.warning("Fast search active · full indexing failed")
+        else:
+            st.info("Ready to chat · enhancing search in background")
+
     st.divider()
     st.markdown("**Model provider**")
     st.caption(
         f"{provider_labels[selected_provider]} · {model or 'model not configured'}\n"
         f"Key · {provider_config.api_key_env}"
     )
-    st.markdown("**Latency mode**")
+    st.markdown("**Retrieval**")
     st.caption(
         f"High recall · top {RETRIEVAL_FINAL_K}\n"
         f"First stage · {RETRIEVAL_DENSE_K}+{RETRIEVAL_SPARSE_K}\n"
-        f"Output cap · {MAX_OUTPUT_TOKENS} tokens"
+        f"Mode · {st.session_state.get('index_mode', 'not loaded')}"
     )
     st.markdown("**About**")
-    st.markdown("Hybrid BM25 + dense retrieval, contextualized child chunks, parent-group reconstruction, high-recall reranking, and grounded generation, with page-aware text, tables, and optional OCR.")
+    st.markdown("Progressive PDF ingestion, BM25-first immediate search, contextualized child chunks, parent/group reconstruction, page-level routing for long documents, high-recall reranking, and grounded generation.")
     st.caption(f"Embedding · {EMBEDDING_MODEL}\nReranker · {RERANKER_MODEL or 'disabled'}")
     if "index" in st.session_state and st.button("Clear document", use_container_width=True):
-        for key in ("index", "doc_name", "messages"):
+        for key in ("index", "doc_name", "messages", "document_id", "index_mode", "pending_doc_name", "upload_ready_ms"):
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -258,14 +252,13 @@ else:
                     raise RuntimeError(f"Add {provider_config.model_env} or enter a model in the sidebar.")
                 retrieval_query = build_followup_query(question, history_before)
                 retrieval_start = perf_counter()
-                with st.spinner("Searching the document…"):
-                    sources = st.session_state.index.retrieve(
-                        retrieval_query,
-                        dense_k=RETRIEVAL_DENSE_K,
-                        sparse_k=RETRIEVAL_SPARSE_K,
-                        final_k=RETRIEVAL_FINAL_K,
-                        rerank_mode=RERANK_MODE,
-                    )
+                sources = st.session_state.index.retrieve(
+                    retrieval_query,
+                    dense_k=RETRIEVAL_DENSE_K,
+                    sparse_k=RETRIEVAL_SPARSE_K,
+                    final_k=RETRIEVAL_FINAL_K,
+                    rerank_mode=RERANK_MODE,
+                )
                 retrieval_wall_ms = (perf_counter() - retrieval_start) * 1000.0
                 if not sources:
                     raise RuntimeError("No relevant passages were found in the document.")
@@ -284,12 +277,12 @@ else:
                     st.caption(
                         " · ".join(
                             [
+                                f"upload-ready {st.session_state.get('upload_ready_ms', 0):.0f} ms",
                                 f"retrieval {retrieval_wall_ms:.0f} ms",
                                 f"LLM {generation_ms:.0f} ms",
                                 f"total {(perf_counter() - request_start) * 1000.0:.0f} ms",
+                                f"index {st.session_state.get('index_mode', 'unknown')}",
                                 f"rerank {st.session_state.index.last_rerank_mode}",
-                                f"coverage {st.session_state.index.last_query_profile}",
-                                f"groups {st.session_state.index.last_evidence_groups}",
                             ]
                         )
                     )

@@ -10,8 +10,17 @@ import numpy as np
 import pymupdf as fitz
 from rank_bm25 import BM25Okapi
 
-from .resrag import Chunk
 from .text_utils import split_into_chunks, tokenize
+
+
+@dataclass(slots=True)
+class Chunk:
+    chunk_id: int
+    page: int
+    text: str
+    kind: str = "text"
+    table_id: int | None = None
+    section: str = ""
 
 
 def document_id(pdf_bytes: bytes) -> str:
@@ -82,7 +91,7 @@ class LightweightProgressiveIndexManager:
 
     def __init__(self, max_workers: int = 1):
         self.jobs: dict[str, LightweightJob] = {}
-        self._background_enabled = os.getenv("RESRAG_BACKGROUND_FULL_INDEX", "1").strip().lower() in {
+        self._background_enabled = os.getenv("RESRAG_BACKGROUND_FULL_INDEX", "0").strip().lower() in {
             "1", "true", "yes", "on"
         }
         self.executor = (

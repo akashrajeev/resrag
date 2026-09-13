@@ -72,17 +72,24 @@ class FastLexicalIndex:
 class LightweightJob:
     digest: str
     fast_index: FastLexicalIndex
-    future: Future
+    future: Future | None
     full_index: Any | None = None
     error: str | None = None
 
 
 class LightweightProgressiveIndexManager:
-    """Upload-safe manager; imports the heavy RAG stack only in the worker."""
+    """Immediate BM25 indexing, with optional heavy background upgrade."""
 
     def __init__(self, max_workers: int = 1):
-        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="resrag-index")
         self.jobs: dict[str, LightweightJob] = {}
+        self._background_enabled = os.getenv("RESRAG_BACKGROUND_FULL_INDEX", "1").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self.executor = (
+            ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="resrag-index")
+            if self._background_enabled
+            else None
+        )
 
     def start(self, pdf_bytes: bytes, embedding_model: str, reranker_model: str | None) -> LightweightJob:
         digest = document_id(pdf_bytes)
@@ -93,14 +100,16 @@ class LightweightProgressiveIndexManager:
 
         chunks = fast_extract_pdf_bytes(pdf_bytes)
         fast_index = FastLexicalIndex(chunks)
-        future = self.executor.submit(_build_full_index_lazy, pdf_bytes, embedding_model, reranker_model)
+        future: Future | None = None
+        if self._background_enabled and self.executor is not None:
+            future = self.executor.submit(_build_full_index_lazy, pdf_bytes, embedding_model, reranker_model)
         job = LightweightJob(digest, fast_index, future)
         self.jobs[digest] = job
         return job
 
     def refresh(self, digest: str) -> LightweightJob | None:
         job = self.jobs.get(digest)
-        if job is None or not job.future.done():
+        if job is None or job.future is None or not job.future.done():
             return job
         if job.full_index is not None or job.error is not None:
             return job
@@ -119,6 +128,6 @@ def _build_full_index_lazy(
     embedding_model: str,
     reranker_model: str | None,
 ):
-    """Import the heavy implementation only after the upload response path has started."""
+    """Load the heavyweight implementation only when explicitly enabled."""
     from .progressive import _build_full_index
     return _build_full_index(pdf_bytes, embedding_model, reranker_model)

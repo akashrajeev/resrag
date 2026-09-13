@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from time import perf_counter
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,10 +12,8 @@ from pydantic import BaseModel, Field
 
 from src.config import load_resrag_env
 from src.grounding import build_context, build_followup_query
+from src.lightweight_runtime import LightweightProgressiveIndexManager
 from src.providers import get_completion_extras, get_provider_client, get_provider_config, provider_keys
-
-if TYPE_CHECKING:
-    from src.progressive import ProgressiveIndexManager
 
 load_resrag_env()
 
@@ -26,18 +24,16 @@ RETRIEVAL_FINAL_K = max(1, int(os.getenv("RETRIEVAL_FINAL_K", "8")))
 RETRIEVAL_DENSE_K = max(1, int(os.getenv("RETRIEVAL_DENSE_K", "32")))
 RETRIEVAL_SPARSE_K = max(1, int(os.getenv("RETRIEVAL_SPARSE_K", "32")))
 MAX_OUTPUT_TOKENS = max(64, int(os.getenv("MAX_OUTPUT_TOKENS", "256")))
-CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+CORS_ORIGINS = [
+    x.strip()
+    for x in os.getenv(
+        "CORS_ORIGINS",
+        "https://resrag.onrender.com,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if x.strip()
+]
 
-_index_manager: "ProgressiveIndexManager | None" = None
-
-
-def get_index_manager() -> "ProgressiveIndexManager":
-    """Load the ML-heavy indexing stack only when a document is actually used."""
-    global _index_manager
-    if _index_manager is None:
-        from src.progressive import ProgressiveIndexManager
-        _index_manager = ProgressiveIndexManager(max_workers=1)
-    return _index_manager
+index_manager = LightweightProgressiveIndexManager(max_workers=1)
 
 
 class ChatRequest(BaseModel):
@@ -83,7 +79,13 @@ def _stream(question: str, retrieved: list[dict], history: list[dict[str, str]],
 
 
 app = FastAPI(title="ResRAG API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/api/health")
@@ -94,7 +96,17 @@ def health():
 
 @app.get("/api/providers")
 def providers():
-    return {"providers":[{"id":s,"name":get_provider_config(s).name,"model_env":get_provider_config(s).model_env,"default_model":get_provider_config(s).default_model} for s in provider_keys()]}
+    return {
+        "providers": [
+            {
+                "id": service,
+                "name": get_provider_config(service).name,
+                "model_env": get_provider_config(service).model_env,
+                "default_model": get_provider_config(service).default_model,
+            }
+            for service in provider_keys()
+        ]
+    }
 
 
 @app.post("/api/documents")
@@ -106,28 +118,45 @@ async def upload_document(file: UploadFile = File(...)):
         raise HTTPException(400, "The uploaded PDF is empty.")
     started = perf_counter()
     try:
-        job = get_index_manager().start(data, EMBEDDING_MODEL, RERANKER_MODEL or None)
+        job = index_manager.start(data, EMBEDDING_MODEL, RERANKER_MODEL or None)
     except Exception as exc:
         raise HTTPException(422, f"Could not open this PDF: {exc}") from exc
-    return {"document_id":job.digest,"filename":file.filename,"pages":len({c.page for c in job.fast_index.chunks}) or None,"status":"full" if job.full_index else "fast","upload_ms":round((perf_counter()-started)*1000,1)}
+    return {
+        "document_id": job.digest,
+        "filename": file.filename,
+        "pages": len({c.page for c in job.fast_index.chunks}) or None,
+        "status": "full" if job.full_index else "fast",
+        "upload_ms": round((perf_counter() - started) * 1000, 1),
+    }
 
 
 @app.get("/api/documents/{document_id}")
 def document_status(document_id: str):
-    job = get_index_manager().get(document_id)
+    job = index_manager.get(document_id)
     if job is None:
         raise HTTPException(404, "Document not found.")
-    return {"document_id":document_id,"status":"full" if job.full_index else "fast","error":job.error,"chunks":len(job.full_index.chunks) if job.full_index else len(job.fast_index.chunks)}
+    return {
+        "document_id": document_id,
+        "status": "full" if job.full_index else "fast",
+        "error": job.error,
+        "chunks": len(job.full_index.chunks) if job.full_index else len(job.fast_index.chunks),
+    }
 
 
 @app.post("/api/chat/stream")
 def chat_stream(request: ChatRequest):
-    job = get_index_manager().get(request.document_id)
+    job = index_manager.get(request.document_id)
     if job is None:
         raise HTTPException(404, "Document not found. Upload the PDF again.")
     index = job.full_index or job.fast_index
     query = build_followup_query(request.question, request.history)
-    retrieved = index.retrieve(query, dense_k=RETRIEVAL_DENSE_K, sparse_k=RETRIEVAL_SPARSE_K, final_k=RETRIEVAL_FINAL_K, rerank_mode=RERANK_MODE)
+    retrieved = index.retrieve(
+        query,
+        dense_k=RETRIEVAL_DENSE_K,
+        sparse_k=RETRIEVAL_SPARSE_K,
+        final_k=RETRIEVAL_FINAL_K,
+        rerank_mode=RERANK_MODE,
+    )
     if not retrieved:
         raise HTTPException(404, "No relevant passages were found in the document.")
     source_json = _sources(retrieved)
@@ -135,10 +164,20 @@ def chat_stream(request: ChatRequest):
     def generate():
         yield f"event: sources\ndata: {json.dumps(source_json)}\n\n"
         try:
-            for token in _stream(request.question, retrieved, request.history, request.provider.strip().lower(), request.model.strip()):
+            for token in _stream(
+                request.question,
+                retrieved,
+                request.history,
+                request.provider.strip().lower(),
+                request.model.strip(),
+            ):
                 yield f"data: {json.dumps(token)}\n\n"
             yield "event: done\ndata: {}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json.dumps(str(exc))}\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

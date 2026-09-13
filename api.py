@@ -110,10 +110,8 @@ def providers():
 
 
 def _job_status(job) -> str:
-    if job.full_index is not None:
+    if job.full_index is not None or job.future is None:
         return "full"
-    if job.future is None:
-        return "ready"
     return "fast"
 
 

@@ -78,7 +78,7 @@ class LightweightJob:
 
 
 class LightweightProgressiveIndexManager:
-    """Immediate BM25 indexing, with optional heavy background upgrade."""
+    """Immediate BM25 indexing with an optional heavyweight background upgrade."""
 
     def __init__(self, max_workers: int = 1):
         self.jobs: dict[str, LightweightJob] = {}

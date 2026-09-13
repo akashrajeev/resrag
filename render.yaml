@@ -15,7 +15,9 @@ services:
       - key: GROQ_MODEL
         value: openai/gpt-oss-20b
       - key: CORS_ORIGINS
-        value: https://resrag-web.onrender.com
+        value: https://resrag.onrender.com
+      - key: RESRAG_BACKGROUND_FULL_INDEX
+        value: "0"
       - key: EMBEDDING_MODEL
         value: BAAI/bge-small-en-v1.5
       - key: RERANKER_MODEL

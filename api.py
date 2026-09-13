@@ -70,7 +70,7 @@ def _stream(question: str, retrieved: list[dict], history: list[dict[str, str]],
         temperature=0,
         max_tokens=MAX_OUTPUT_TOKENS,
         stream=True,
-        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         **get_completion_extras(provider, resolved),
     )
     for part in response:
@@ -109,6 +109,14 @@ def providers():
     }
 
 
+def _job_status(job) -> str:
+    if job.full_index is not None:
+        return "full"
+    if job.future is None:
+        return "ready"
+    return "fast"
+
+
 @app.post("/api/documents")
 async def upload_document(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -125,7 +133,7 @@ async def upload_document(file: UploadFile = File(...)):
         "document_id": job.digest,
         "filename": file.filename,
         "pages": len({c.page for c in job.fast_index.chunks}) or None,
-        "status": "full" if job.full_index else "fast",
+        "status": _job_status(job),
         "upload_ms": round((perf_counter() - started) * 1000, 1),
     }
 
@@ -137,7 +145,7 @@ def document_status(document_id: str):
         raise HTTPException(404, "Document not found.")
     return {
         "document_id": document_id,
-        "status": "full" if job.full_index else "fast",
+        "status": _job_status(job),
         "error": job.error,
         "chunks": len(job.full_index.chunks) if job.full_index else len(job.fast_index.chunks),
     }
